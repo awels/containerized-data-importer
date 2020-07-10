@@ -17,6 +17,12 @@ rpm_image(
         "@capstone//file",
         "@ostree-libs//file",
         "@containers-common//file",
+        "@nbdkit-server//file",
+        "@nbdkit-basic-filters//file",
+        "@nbdkit-basic-plugins//file",
+        "@nbdkit-curl-plugin//file",
+        "@nbdkit-xz-filter//file",
+        "@nbdkit//file",
     ],
 )
 

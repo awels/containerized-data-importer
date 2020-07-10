@@ -7,6 +7,7 @@ go_library(
         "format-readers.go",
         "http-datasource.go",
         "imageio-datasource.go",
+        "nbdkit-http-datasource.go",
         "registry-datasource.go",
         "s3-datasource.go",
         "transport.go",
@@ -42,6 +43,7 @@ go_library(
         "//vendor/github.com/vmware/govmomi/object:go_default_library",
         "//vendor/golang.org/x/sys/unix:go_default_library",
         "//vendor/k8s.io/apimachinery/pkg/api/resource:go_default_library",
+        "//vendor/k8s.io/klog:go_default_library",
         "//vendor/k8s.io/klog/v2:go_default_library",
     ],
 )

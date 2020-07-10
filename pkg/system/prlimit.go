@@ -124,6 +124,7 @@ func executeWithLimits(limits *ProcessLimitValues, callback func(string), logErr
 	stdoutDone := make(chan bool)
 	stderrDone := make(chan bool)
 
+	klog.V(1).Infof("command: [%s], args: %v", command, args)
 	if limits != nil && limits.CPUTimeLimit > 0 {
 		klog.V(3).Infof("Setting CPU limit to %d\n", limits.CPUTimeLimit)
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(limits.CPUTimeLimit)*time.Second)

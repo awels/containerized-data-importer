@@ -622,3 +622,51 @@ http_file(
         "https://storage.googleapis.com/builddeps/f77f5dc88066d67b665440afafeab69e928a088ddba94d28955c368844a6bfad",
     ],
 )
+
+http_file(
+    name = "nbdkit-server",
+    sha256 = "30cb9fbc293edeb4fde3c990b24d6eb1511b9aff1c2b0f360e495b6868f67b7c",
+    urls = [
+        "https://download.fedoraproject.org/pub/fedora/linux/updates/31/Everything/x86_64/Packages/n/nbdkit-server-1.20.4-1.fc31.x86_64.rpm",
+    ],
+)
+
+http_file(
+    name = "nbdkit-basic-filters",
+    sha256 = "b205232aa7e3b93942e62553af3759d39fb1246ce7e547829c724b063d2b829e",
+    urls = [
+        "https://download.fedoraproject.org/pub/fedora/linux/updates/31/Everything/x86_64/Packages/n/nbdkit-basic-filters-1.20.4-1.fc31.x86_64.rpm",
+    ],
+)
+
+http_file(
+    name = "nbdkit-basic-plugins",
+    sha256 = "911113c6326baa320c5bc6d4a388d58c6f0df601af9a80fb4bed1f8c093c5685",
+    urls = [
+        "https://download.fedoraproject.org/pub/fedora/linux/updates/31/Everything/x86_64/Packages/n/nbdkit-basic-plugins-1.20.4-1.fc31.x86_64.rpm",
+    ],
+)
+
+http_file(
+    name = "nbdkit",
+    sha256 = "34a3c69c1bd7203c688d1eff18371c9dfe38d96879ba34b9aaa50d079d110d36",
+    urls = [
+        "https://download.fedoraproject.org/pub/fedora/linux/updates/31/Everything/x86_64/Packages/n/nbdkit-1.20.4-1.fc31.x86_64.rpm",
+    ],
+)
+
+http_file(
+    name = "nbdkit-curl-plugin",
+    sha256 = "7e3acd71c33dc86b21d9503e09514a8d47fa0ea3c69f3225ad8fa614bb9b5775",
+    urls = [
+        "https://download.fedoraproject.org/pub/fedora/linux/updates/31/Everything/x86_64/Packages/n/nbdkit-curl-plugin-1.20.4-1.fc31.x86_64.rpm",
+    ],
+)
+
+http_file(
+    name = "nbdkit-xz-filter",
+    sha256 = "4ca12c5a3782e8bab368cc4b81ab50dc95a19f9d83b4bb44ae993006d55780f2",
+    urls = [
+        "https://download.fedoraproject.org/pub/fedora/linux/updates/31/Everything/x86_64/Packages/n/nbdkit-xz-filter-1.20.4-1.fc31.x86_64.rpm",
+    ],
+)
