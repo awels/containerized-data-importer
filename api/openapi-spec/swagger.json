@@ -3817,6 +3817,13 @@
      "url"
     ],
     "properties": {
+<<<<<<< Updated upstream
+=======
+     "certConfigMap": {
+      "description": "CertConfigMap is a configmap reference, containing a Certificate Authority(CA) public key, and a base64 encoded pem certificate",
+      "type": "string"
+     },
+>>>>>>> Stashed changes
      "secretRef": {
       "description": "SecretRef provides the secret reference needed to access the S3 source",
       "type": "string"
