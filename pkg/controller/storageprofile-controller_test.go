@@ -24,7 +24,8 @@ import (
 	snapshotv1 "github.com/kubernetes-csi/external-snapshotter/client/v6/apis/volumesnapshot/v1"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	prometheus "github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -38,6 +39,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
+	storagehelpers "k8s.io/component-helpers/storage/volume"
 	"k8s.io/utils/pointer"
 
 	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
@@ -54,10 +56,6 @@ const (
 
 var (
 	storageProfileLog = logf.Log.WithName("storageprofile-controller-test")
-	lsoLabels         = map[string]string{
-		"local.storage.openshift.io/owner-name":      "local",
-		"local.storage.openshift.io/owner-namespace": "openshift-local-storage",
-	}
 )
 
 var _ = Describe("Storage profile controller reconcile loop", func() {
@@ -181,8 +179,8 @@ var _ = Describe("Storage profile controller reconcile loop", func() {
 		Expect(sp.Status.ClaimPropertySets).To(Equal(claimPropertySets))
 	})
 
-	It("Should find storage capabilities for no-provisioner LSO storage class", func() {
-		storageClass := CreateStorageClassWithProvisioner(storageClassName, map[string]string{AnnDefaultStorageClass: "true"}, lsoLabels, "kubernetes.io/no-provisioner")
+	It("Should find storage capabilities for no-provisioner storage class", func() {
+		storageClass := CreateStorageClassWithProvisioner(storageClassName, map[string]string{AnnDefaultStorageClass: "true"}, nil, storagehelpers.NotSupportedProvisioner)
 		pv := CreatePv("my-pv", storageClassName)
 
 		reconciler = createStorageProfileReconciler(storageClass, pv)
@@ -198,8 +196,8 @@ var _ = Describe("Storage profile controller reconcile loop", func() {
 		Expect(sp.Status.ClaimPropertySets).ToNot(BeEmpty())
 	})
 
-	It("Should not have storage capabilities for no-provisioner LSO storage class if there are no PVs for it", func() {
-		storageClass := CreateStorageClassWithProvisioner(storageClassName, map[string]string{AnnDefaultStorageClass: "true"}, lsoLabels, "kubernetes.io/no-provisioner")
+	It("Should not have storage capabilities for no-provisioner storage class if there are no PVs for it", func() {
+		storageClass := CreateStorageClassWithProvisioner(storageClassName, map[string]string{AnnDefaultStorageClass: "true"}, nil, storagehelpers.NotSupportedProvisioner)
 
 		reconciler = createStorageProfileReconciler(storageClass)
 		_, err := reconciler.Reconcile(context.TODO(), reconcile.Request{NamespacedName: types.NamespacedName{Name: storageClassName}})
@@ -274,7 +272,7 @@ var _ = Describe("Storage profile controller reconcile loop", func() {
 		Expect(updatedSp.Labels[common.AppKubernetesPartOfLabel]).To(Equal("newtesting"))
 	})
 
-	It("Should error when updating storage profile with missing access modes", func() {
+	DescribeTable("Should error when updating storage profile with missing", func(hasVolumeMode, hasAccessModes bool) {
 		reconciler = createStorageProfileReconciler(CreateStorageClass(storageClassName, map[string]string{AnnDefaultStorageClass: "true"}))
 		_, err := reconciler.Reconcile(context.TODO(), reconcile.Request{NamespacedName: types.NamespacedName{Name: storageClassName}})
 		Expect(err).ToNot(HaveOccurred())
@@ -286,16 +284,24 @@ var _ = Describe("Storage profile controller reconcile loop", func() {
 		Expect(*sp.Status.StorageClass).To(Equal(storageClassName))
 		Expect(sp.Status.ClaimPropertySets).To(BeEmpty())
 
+		partialClaimPropertySet := cdiv1.ClaimPropertySet{}
+		if hasVolumeMode {
+			partialClaimPropertySet.VolumeMode = &FilesystemMode
+		}
+		if hasAccessModes {
+			partialClaimPropertySet.AccessModes = []v1.PersistentVolumeAccessMode{v1.ReadWriteOncePod}
+		}
+
 		claimPropertySets := []cdiv1.ClaimPropertySet{
 			{AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadOnlyMany}, VolumeMode: &BlockMode},
-			{VolumeMode: &FilesystemMode},
+			partialClaimPropertySet,
 		}
 		sp.Spec.ClaimPropertySets = claimPropertySets
 		err = reconciler.client.Update(context.TODO(), sp.DeepCopy())
 		Expect(err).ToNot(HaveOccurred())
 		_, err = reconciler.Reconcile(context.TODO(), reconcile.Request{NamespacedName: types.NamespacedName{Name: storageClassName}})
 		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring(fmt.Sprintf("must provide access mode for volume mode: %s", FilesystemMode)))
+		Expect(err.Error()).To(ContainSubstring("each ClaimPropertySet must provide both volume mode and access modes"))
 		err = reconciler.client.List(context.TODO(), storageProfileList, &client.ListOptions{})
 		Expect(err).ToNot(HaveOccurred())
 		Expect(storageProfileList.Items).To(HaveLen(1))
@@ -303,7 +309,11 @@ var _ = Describe("Storage profile controller reconcile loop", func() {
 		Expect(*updatedSp.Status.StorageClass).To(Equal(storageClassName))
 		Expect(updatedSp.Status.ClaimPropertySets).To(BeEmpty())
 		Expect(updatedSp.Spec.ClaimPropertySets).To(Equal(claimPropertySets))
-	})
+	},
+		Entry("volume mode", false, true),
+		Entry("access modes", true, false),
+		Entry("both volume mode and access modes", false, false),
+	)
 
 	DescribeTable("should create clone strategy", func(cloneStrategy cdiv1.CDICloneStrategy) {
 		storageClass := CreateStorageClass(storageClassName, map[string]string{AnnDefaultStorageClass: "true"})
@@ -472,7 +482,9 @@ var _ = Describe("Storage profile controller reconcile loop", func() {
 		sp := storageProfileList.Items[0]
 		Expect(*sp.Status.StorageClass).To(Equal(storageClassName))
 		Expect(sp.Status.ClaimPropertySets).To(BeEmpty())
-		Expect(int(prometheus.ToFloat64(IncompleteProfileGauge))).To(Equal(count))
+
+		labels := createLabels(storageClassName, provisioner, false, true, false, false, false)
+		Expect(int(testutil.ToFloat64(StorageProfileStatusGaugeVec.With(labels)))).To(Equal(count))
 	},
 		Entry("Noobaa (not supported)", storagecapabilities.ProvisionerNoobaa, 0),
 		Entry("Unknown provisioner", "unknown-provisioner", 1),

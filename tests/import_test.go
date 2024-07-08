@@ -939,15 +939,22 @@ var _ = Describe("[rfe_id:1115][crit:high][vendor:cnv-qe@redhat.com][level:compo
 		restartsValue, status, err := utils.WaitForPVCAnnotation(f.K8sClient, f.Namespace.Name, pvc, controller.AnnPodRestarts)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(status).To(BeTrue())
-		Expect(restartsValue).To(Equal("0"))
+		// Restarting the pod for scratch space causes a restart in the DataVolume.
+		// This is expected behavior.
+		expectedRestarts := 1
+		Expect(restartsValue).To(Equal(strconv.Itoa(expectedRestarts)))
 
 		By("Verify the number of retries on the datavolume")
 		dv, err = f.CdiClient.CdiV1beta1().DataVolumes(f.Namespace.Name).Get(context.TODO(), dataVolume.Name, metav1.GetOptions{})
 		Expect(err).NotTo(HaveOccurred())
-		Expect(dv.Status.RestartCount).To(BeNumerically("==", 0))
+		Expect(dv.Status.RestartCount).To(BeNumerically("==", expectedRestarts))
 	})
 
 	It("[test_id:3996] Import datavolume with bad url will increase dv retry count", func() {
+		if f.IsPrometheusAvailable() {
+			dataVolumeNoUnusualRestartTest(f)
+		}
+
 		dvName := "import-dv-bad-url"
 		By(fmt.Sprintf("Creating new datavolume %s", dvName))
 		dv := utils.NewDataVolumeWithHTTPImport(dvName, "100Mi", invalidQcowImagesURL())
@@ -2077,6 +2084,40 @@ var _ = Describe("Import populator", func() {
 		Expect(err).ToNot(HaveOccurred())
 		err = f.DeletePVC(pvcPrime)
 		Expect(err).ToNot(HaveOccurred())
+	})
+
+	It("should recreate and reimport pvc if it was deleted", func() {
+		dataVolume := utils.NewDataVolumeWithHTTPImport("import-dv", "100Mi", fmt.Sprintf(utils.TinyCoreIsoURL, f.CdiInstallNs))
+		dv, err := utils.CreateDataVolumeFromDefinition(f.CdiClient, f.Namespace.Name, dataVolume)
+		Expect(err).ToNot(HaveOccurred())
+
+		pvc, err = utils.WaitForPVC(f.K8sClient, dv.Namespace, dv.Name)
+		Expect(err).ToNot(HaveOccurred())
+		f.ForceBindIfWaitForFirstConsumer(pvc)
+
+		By("Wait for import to be completed")
+		err = utils.WaitForDataVolumePhase(f, dv.Namespace, cdiv1.Succeeded, dv.Name)
+		Expect(err).ToNot(HaveOccurred(), "Datavolume not in phase succeeded in time")
+
+		By("Delete PVC and wait for it to be deleted")
+		err = f.DeletePVC(pvc)
+		Expect(err).ToNot(HaveOccurred())
+		deleted, err := f.WaitPVCDeletedByUID(pvc, time.Minute)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(deleted).To(BeTrue())
+
+		pvc, err = utils.WaitForPVC(f.K8sClient, dv.Namespace, dv.Name)
+		Expect(err).ToNot(HaveOccurred())
+		f.ForceBindIfWaitForFirstConsumer(pvc)
+
+		By("Verify target PVC is bound again")
+		err = utils.WaitForPersistentVolumeClaimPhase(f.K8sClient, pvc.Namespace, v1.ClaimBound, pvc.Name)
+		Expect(err).ToNot(HaveOccurred())
+
+		By("Verify content")
+		md5, err := f.GetMD5(f.Namespace, pvc, utils.DefaultImagePath, utils.MD5PrefixSize)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(md5).To(Equal(utils.TinyCoreMD5))
 	})
 })
 

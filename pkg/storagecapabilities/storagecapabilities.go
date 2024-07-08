@@ -8,6 +8,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	storagehelpers "k8s.io/component-helpers/storage/volume"
 	"kubevirt.io/containerized-data-importer/pkg/util"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -77,7 +78,7 @@ var CapabilitiesByProvisionerKey = map[string][]StorageCapabilities{
 	// Hitachi
 	"hspc.csi.hitachi.com": {{rwx, block}, {rwo, block}, {rwo, file}},
 	// HPE
-	"csi.hpe.com": createRWOBlockAndFilesystemCapabilities(),
+	"csi.hpe.com": {{rwx, block}, {rwo, block}, {rwo, file}},
 	// IBM HCI/GPFS2 (Spectrum Scale / Spectrum Fusion)
 	"spectrumscale.csi.ibm.com": {{rwx, file}, {rwo, file}},
 	// IBM block arrays (FlashSystem)
@@ -91,7 +92,7 @@ var CapabilitiesByProvisionerKey = map[string][]StorageCapabilities{
 	"pxd.portworx.com/shared":    createOpenStorageSharedVolumeCapabilities(),
 	"pxd.portworx.com":           createOpenStorageSharedVolumeCapabilities(),
 	// Trident
-	"csi.trident.netapp.io/ontap-nas": {{rwx, file}},
+	"csi.trident.netapp.io/ontap-nas": {{rwx, file}, {rwo, file}},
 	"csi.trident.netapp.io/ontap-san": {{rwx, block}},
 	// topolvm
 	"topolvm.cybozu.com": createTopoLVMCapabilities(),
@@ -102,6 +103,9 @@ var CapabilitiesByProvisionerKey = map[string][]StorageCapabilities{
 	"manila.csi.openstack.org": {{rwx, file}},
 	// ovirt csi
 	"csi.ovirt.org": createRWOBlockAndFilesystemCapabilities(),
+	// Infinidat
+	"infinibox-csi-driver/iscsiorfibrechannel": {{rwx, block}, {rwo, block}, {rwo, file}},
+	"infinibox-csi-driver/nfs":                 {{rwx, file}, {rwo, file}},
 }
 
 // SourceFormatsByProvisionerKey defines the advised data import cron source format
@@ -109,38 +113,58 @@ var CapabilitiesByProvisionerKey = map[string][]StorageCapabilities{
 var SourceFormatsByProvisionerKey = map[string]cdiv1.DataImportCronSourceFormat{
 	"rook-ceph.rbd.csi.ceph.com":         cdiv1.DataImportCronSourceFormatSnapshot,
 	"openshift-storage.rbd.csi.ceph.com": cdiv1.DataImportCronSourceFormatSnapshot,
+	"csi.trident.netapp.io/ontap-nas":    cdiv1.DataImportCronSourceFormatSnapshot,
+	"csi.trident.netapp.io/ontap-san":    cdiv1.DataImportCronSourceFormatSnapshot,
 }
 
 // CloneStrategyByProvisionerKey defines the advised clone strategy for a provisioner
 var CloneStrategyByProvisionerKey = map[string]cdiv1.CDICloneStrategy{
-	"csi-vxflexos.dellemc.com":              cdiv1.CloneStrategyCsiClone,
-	"csi-isilon.dellemc.com":                cdiv1.CloneStrategyCsiClone,
-	"csi-powermax.dellemc.com":              cdiv1.CloneStrategyCsiClone,
-	"csi-powerstore.dellemc.com":            cdiv1.CloneStrategyCsiClone,
-	"hspc.csi.hitachi.com":                  cdiv1.CloneStrategyCsiClone,
-	"csi.hpe.com":                           cdiv1.CloneStrategyCsiClone,
-	"spectrumscale.csi.ibm.com":             cdiv1.CloneStrategyCsiClone,
-	"rook-ceph.rbd.csi.ceph.com":            cdiv1.CloneStrategyCsiClone,
-	"openshift-storage.rbd.csi.ceph.com":    cdiv1.CloneStrategyCsiClone,
-	"cephfs.csi.ceph.com":                   cdiv1.CloneStrategyCsiClone,
-	"openshift-storage.cephfs.csi.ceph.com": cdiv1.CloneStrategyCsiClone,
-	"csi.trident.netapp.io":                 cdiv1.CloneStrategyCsiClone,
+	"csi-vxflexos.dellemc.com":                 cdiv1.CloneStrategyCsiClone,
+	"csi-isilon.dellemc.com":                   cdiv1.CloneStrategyCsiClone,
+	"csi-powermax.dellemc.com":                 cdiv1.CloneStrategyCsiClone,
+	"csi-powerstore.dellemc.com":               cdiv1.CloneStrategyCsiClone,
+	"hspc.csi.hitachi.com":                     cdiv1.CloneStrategyCsiClone,
+	"csi.hpe.com":                              cdiv1.CloneStrategyCsiClone,
+	"spectrumscale.csi.ibm.com":                cdiv1.CloneStrategyCsiClone,
+	"rook-ceph.rbd.csi.ceph.com":               cdiv1.CloneStrategyCsiClone,
+	"openshift-storage.rbd.csi.ceph.com":       cdiv1.CloneStrategyCsiClone,
+	"cephfs.csi.ceph.com":                      cdiv1.CloneStrategyCsiClone,
+	"openshift-storage.cephfs.csi.ceph.com":    cdiv1.CloneStrategyCsiClone,
+	"pxd.openstorage.org/shared":               cdiv1.CloneStrategyCsiClone,
+	"pxd.openstorage.org":                      cdiv1.CloneStrategyCsiClone,
+	"pxd.portworx.com/shared":                  cdiv1.CloneStrategyCsiClone,
+	"pxd.portworx.com":                         cdiv1.CloneStrategyCsiClone,
+	"topolvm.cybozu.com":                       cdiv1.CloneStrategyHostAssisted,
+	"topolvm.io":                               cdiv1.CloneStrategyHostAssisted,
+	"infinibox-csi-driver/iscsiorfibrechannel": cdiv1.CloneStrategyCsiClone,
+	"infinibox-csi-driver/nfs":                 cdiv1.CloneStrategyCsiClone,
+	"csi.trident.netapp.io/ontap-nas":          cdiv1.CloneStrategySnapshot,
+	"csi.trident.netapp.io/ontap-san":          cdiv1.CloneStrategySnapshot,
 }
 
-// ProvisionerNoobaa is the provisioner string for the Noobaa object bucket provisioner which does not work with CDI
-const ProvisionerNoobaa = "openshift-storage.noobaa.io/obc"
+const (
+	// ProvisionerNoobaa is the provisioner string for the Noobaa object bucket provisioner which does not work with CDI
+	ProvisionerNoobaa = "openshift-storage.noobaa.io/obc"
+	// ProvisionerOCSBucket is the provisioner string for the downstream ODF/OCS provisoner for buckets which does not work with CDI
+	ProvisionerOCSBucket = "openshift-storage.ceph.rook.io/bucket"
+	// ProvisionerRookCephBucket is the provisioner string for the upstream Rook Ceph provisoner for buckets which does not work with CDI
+	ProvisionerRookCephBucket = "rook-ceph.ceph.rook.io/bucket"
+	// ProvisionerStorkSnapshot is the provisioner string for the Stork snapshot provisoner which does not work with CDI
+	ProvisionerStorkSnapshot = "stork-snapshot"
+)
 
 // UnsupportedProvisioners is a hash of provisioners which are known not to work with CDI
 var UnsupportedProvisioners = map[string]struct{}{
-	// The following provisioners may be found in Rook/Ceph deployments and are related to object storage
-	"openshift-storage.ceph.rook.io/bucket": {},
-	ProvisionerNoobaa:                       {},
+	ProvisionerOCSBucket:      {},
+	ProvisionerRookCephBucket: {},
+	ProvisionerNoobaa:         {},
+	ProvisionerStorkSnapshot:  {},
 }
 
 // GetCapabilities finds and returns a predefined StorageCapabilities for a given StorageClass
 func GetCapabilities(cl client.Client, sc *storagev1.StorageClass) ([]StorageCapabilities, bool) {
 	provisionerKey := storageProvisionerKey(sc)
-	if provisionerKey == "kubernetes.io/no-provisioner" {
+	if provisionerKey == storagehelpers.NotSupportedProvisioner {
 		return capabilitiesForNoProvisioner(cl, sc)
 	}
 	capabilities, found := CapabilitiesByProvisionerKey[provisionerKey]
@@ -161,20 +185,7 @@ func GetAdvisedCloneStrategy(sc *storagev1.StorageClass) (cdiv1.CDICloneStrategy
 	return strategy, found
 }
 
-func isLocalStorageOperator(sc *storagev1.StorageClass) bool {
-	_, found := sc.Labels["local.storage.openshift.io/owner-name"]
-	return found
-}
-
-func knownNoProvisioner(sc *storagev1.StorageClass) bool {
-	return isLocalStorageOperator(sc)
-}
-
 func capabilitiesForNoProvisioner(cl client.Client, sc *storagev1.StorageClass) ([]StorageCapabilities, bool) {
-	// There's so many no-provisioner storage classes, let's start slow with the known ones.
-	if !knownNoProvisioner(sc) {
-		return []StorageCapabilities{}, false
-	}
 	pvs := &v1.PersistentVolumeList{}
 	err := cl.List(context.TODO(), pvs)
 	if err != nil {
@@ -218,7 +229,7 @@ func storageProvisionerKey(sc *storagev1.StorageClass) string {
 
 var storageClassToProvisionerKeyMapper = map[string]func(sc *storagev1.StorageClass) string{
 	"pxd.openstorage.org": func(sc *storagev1.StorageClass) string {
-		//https://docs.portworx.com/portworx-install-with-kubernetes/storage-operations/create-pvcs/create-shared-pvcs/
+		// https://docs.portworx.com/portworx-install-with-kubernetes/storage-operations/create-pvcs/create-shared-pvcs/
 		val := sc.Parameters["shared"]
 		if val == "true" {
 			return "pxd.openstorage.org/shared"
@@ -233,7 +244,7 @@ var storageClassToProvisionerKeyMapper = map[string]func(sc *storagev1.StorageCl
 		return "kubernetes.io/portworx-volume"
 	},
 	"pxd.portworx.com": func(sc *storagev1.StorageClass) string {
-		//https://docs.portworx.com/portworx-install-with-kubernetes/storage-operations/csi/volumelifecycle/#create-shared-csi-enabled-volumes
+		// https://docs.portworx.com/portworx-install-with-kubernetes/storage-operations/csi/volumelifecycle/#create-shared-csi-enabled-volumes
 		val := sc.Parameters["shared"]
 		if val == "true" {
 			return "pxd.portworx.com/shared"
@@ -241,7 +252,7 @@ var storageClassToProvisionerKeyMapper = map[string]func(sc *storagev1.StorageCl
 		return "pxd.portworx.com"
 	},
 	"csi.trident.netapp.io": func(sc *storagev1.StorageClass) string {
-		//https://netapp-trident.readthedocs.io/en/stable-v20.04/kubernetes/concepts/objects.html#kubernetes-storageclass-objects
+		// https://netapp-trident.readthedocs.io/en/stable-v20.04/kubernetes/concepts/objects.html#kubernetes-storageclass-objects
 		val := sc.Parameters["backendType"]
 		if strings.HasPrefix(val, "ontap-nas") {
 			return "csi.trident.netapp.io/ontap-nas"
@@ -250,6 +261,17 @@ var storageClassToProvisionerKeyMapper = map[string]func(sc *storagev1.StorageCl
 			return "csi.trident.netapp.io/ontap-san"
 		}
 		return "UNKNOWN"
+	},
+	"infinibox-csi-driver": func(sc *storagev1.StorageClass) string {
+		// https://github.com/Infinidat/infinibox-csi-driver/tree/develop/deploy/examples
+		switch sc.Parameters["storage_protocol"] {
+		case "iscsi", "fc":
+			return "infinibox-csi-driver/iscsiorfibrechannel"
+		case "nfs", "nfs_treeq":
+			return "infinibox-csi-driver/nfs"
+		default:
+			return "UNKNOWN"
+		}
 	},
 }
 

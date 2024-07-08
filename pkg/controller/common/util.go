@@ -147,8 +147,13 @@ const (
 	// AnnVddkInitImageURL saves a per-DV VDDK image URL on the PVC
 	AnnVddkInitImageURL = AnnAPIGroup + "/storage.pod.vddk.initimageurl"
 
-	// AnnRequiresScratch provides a const for our PVC requires scratch annotation
+	// AnnRequiresScratch provides a const for our PVC requiring scratch annotation
 	AnnRequiresScratch = AnnAPIGroup + "/storage.import.requiresScratch"
+
+	// AnnRequiresDirectIO provides a const for our PVC requiring direct io annotation (due to OOMs we need to try qemu cache=none)
+	AnnRequiresDirectIO = AnnAPIGroup + "/storage.import.requiresDirectIo"
+	// OOMKilledReason provides a value that container runtimes must return in the reason field for an OOMKilled container
+	OOMKilledReason = "OOMKilled"
 
 	// AnnContentType provides a const for the PVC content-type
 	AnnContentType = AnnAPIGroup + "/storage.contentType"
@@ -217,6 +222,9 @@ const (
 	// AnnDefaultSnapshotClass is the annotation indicating that a snapshot class is the default one
 	AnnDefaultSnapshotClass = "snapshot.storage.kubernetes.io/is-default-class"
 
+	// AnnSourceVolumeMode is the volume mode of the source PVC specified as an annotation on snapshots
+	AnnSourceVolumeMode = AnnAPIGroup + "/storage.import.sourceVolumeMode"
+
 	// AnnOpenShiftImageLookup is the annotation for OpenShift image stream lookup
 	AnnOpenShiftImageLookup = "alpha.image.policy.openshift.io/resolve-names"
 
@@ -240,6 +248,9 @@ const (
 	// AnnSelectedNode annotation is added to a PVC that has been triggered by scheduler to
 	// be dynamically provisioned. Its value is the name of the selected node.
 	AnnSelectedNode = "volume.kubernetes.io/selected-node"
+
+	// AnnGarbageCollected is a PVC annotation indicating that the PVC was garbage collected
+	AnnGarbageCollected = AnnAPIGroup + "/garbageCollected"
 
 	// CloneUniqueID is used as a special label to be used when we search for the pod
 	CloneUniqueID = "cdi.kubevirt.io/storage.clone.cloneUniqeId"
@@ -316,6 +327,12 @@ const (
 	AnnEventSourceKind = "cdi.kubevirt.io/events.source.kind"
 	// AnnEventSource is the source that should be related to events (namespace/name)
 	AnnEventSource = "cdi.kubevirt.io/events.source"
+
+	// AnnAllowClaimAdoption is the annotation that allows a claim to be adopted by a DataVolume
+	AnnAllowClaimAdoption = AnnAPIGroup + "/allowClaimAdoption"
+
+	// AnnCreatedForDataVolume stores the UID of the datavolume that the PVC was created for
+	AnnCreatedForDataVolume = AnnAPIGroup + "/createdForDataVolume"
 )
 
 // Size-detection pod error codes
@@ -448,6 +465,24 @@ func GetVolumeMode(pvc *corev1.PersistentVolumeClaim) corev1.PersistentVolumeMod
 	return util.ResolveVolumeMode(pvc.Spec.VolumeMode)
 }
 
+// IsDataVolumeUsingDefaultStorageClass checks if the DataVolume is using the default StorageClass
+func IsDataVolumeUsingDefaultStorageClass(dv *cdiv1.DataVolume) bool {
+	return GetStorageClassFromDVSpec(dv) == nil
+}
+
+// GetStorageClassFromDVSpec returns the StorageClassName from DataVolume PVC or Storage spec
+func GetStorageClassFromDVSpec(dv *cdiv1.DataVolume) *string {
+	if dv.Spec.PVC != nil {
+		return dv.Spec.PVC.StorageClassName
+	}
+
+	if dv.Spec.Storage != nil {
+		return dv.Spec.Storage.StorageClassName
+	}
+
+	return nil
+}
+
 // getStorageClassByName looks up the storage class based on the name.
 // If name is nil, it performs fallback to default according to the provided content type
 // If no storage class is found, returns nil
@@ -485,7 +520,7 @@ func GetStorageClassByNameWithVirtFallback(ctx context.Context, client client.Cl
 	return getStorageClassByName(ctx, client, name, contentType)
 }
 
-// getFallbackStorageClass looks for a default virt/k8s storage class according to the boolean
+// getFallbackStorageClass looks for a default virt/k8s storage class according to the content type
 // If no storage class is found, returns nil
 func getFallbackStorageClass(ctx context.Context, client client.Client, contentType cdiv1.DataVolumeContentType) (*storagev1.StorageClass, error) {
 	storageClasses := &storagev1.StorageClassList{}
@@ -495,16 +530,15 @@ func getFallbackStorageClass(ctx context.Context, client client.Client, contentT
 	}
 
 	if GetContentType(contentType) == cdiv1.DataVolumeKubeVirt {
-		virtSc := GetPlatformDefaultStorageClass(ctx, storageClasses, AnnDefaultVirtStorageClass)
-		if virtSc != nil {
+		if virtSc := GetPlatformDefaultStorageClass(storageClasses, AnnDefaultVirtStorageClass); virtSc != nil {
 			return virtSc, nil
 		}
 	}
-	return GetPlatformDefaultStorageClass(ctx, storageClasses, AnnDefaultStorageClass), nil
+	return GetPlatformDefaultStorageClass(storageClasses, AnnDefaultStorageClass), nil
 }
 
 // GetPlatformDefaultStorageClass returns the default storage class according to the provided annotation or nil if none found
-func GetPlatformDefaultStorageClass(ctx context.Context, storageClasses *storagev1.StorageClassList, defaultAnnotationKey string) *storagev1.StorageClass {
+func GetPlatformDefaultStorageClass(storageClasses *storagev1.StorageClassList, defaultAnnotationKey string) *storagev1.StorageClass {
 	defaultClasses := []storagev1.StorageClass{}
 
 	for _, storageClass := range storageClasses.Items {
@@ -723,6 +757,14 @@ func GetActiveCDI(ctx context.Context, c client.Client) (*cdiv1.CDI, error) {
 		return nil, err
 	}
 
+	if len(crList.Items) == 0 {
+		return nil, nil
+	}
+
+	if len(crList.Items) == 1 {
+		return &crList.Items[0], nil
+	}
+
 	var activeResources []cdiv1.CDI
 	for _, cr := range crList.Items {
 		if cr.Status.Phase != sdkapi.PhaseError {
@@ -730,12 +772,8 @@ func GetActiveCDI(ctx context.Context, c client.Client) (*cdiv1.CDI, error) {
 		}
 	}
 
-	if len(activeResources) == 0 {
-		return nil, nil
-	}
-
-	if len(activeResources) > 1 {
-		return nil, fmt.Errorf("number of active CDI CRs > 1")
+	if len(activeResources) != 1 {
+		return nil, fmt.Errorf("invalid number of active CDI resources: %d", len(activeResources))
 	}
 
 	return &activeResources[0], nil
@@ -780,7 +818,7 @@ func GetPriorityClass(pvc *corev1.PersistentVolumeClaim) string {
 
 // ShouldDeletePod returns whether the PVC workload pod should be deleted
 func ShouldDeletePod(pvc *corev1.PersistentVolumeClaim) bool {
-	return pvc.GetAnnotations()[AnnPodRetainAfterCompletion] != "true" || pvc.GetAnnotations()[AnnRequiresScratch] == "true" || pvc.DeletionTimestamp != nil
+	return pvc.GetAnnotations()[AnnPodRetainAfterCompletion] != "true" || pvc.GetAnnotations()[AnnRequiresScratch] == "true" || pvc.GetAnnotations()[AnnRequiresDirectIO] == "true" || pvc.DeletionTimestamp != nil
 }
 
 // AddFinalizer adds a finalizer to a resource
@@ -1190,6 +1228,9 @@ func CreatePvcInStorageClass(name, ns string, storageClassName *string, annotati
 		},
 	}
 	pvc.Status.Capacity = pvc.Spec.Resources.Requests.DeepCopy()
+	if pvc.Status.Phase == corev1.ClaimBound {
+		pvc.Spec.VolumeName = "pv-" + string(pvc.UID)
+	}
 	return pvc
 }
 
@@ -2082,4 +2123,35 @@ func SetPvcAllowedAnnotations(obj metav1.Object, pvc *corev1.PersistentVolumeCla
 			AddAnnotation(obj, ann, val)
 		}
 	}
+}
+
+// ClaimMayExistBeforeDataVolume returns true if the PVC may exist before the DataVolume
+func ClaimMayExistBeforeDataVolume(c client.Client, pvc *corev1.PersistentVolumeClaim, dv *cdiv1.DataVolume) (bool, error) {
+	if ClaimIsPopulatedForDataVolume(pvc, dv) {
+		return true, nil
+	}
+	return AllowClaimAdoption(c, pvc, dv)
+}
+
+// ClaimIsPopulatedForDataVolume returns true if the PVC is populated for the given DataVolume
+func ClaimIsPopulatedForDataVolume(pvc *corev1.PersistentVolumeClaim, dv *cdiv1.DataVolume) bool {
+	return pvc != nil && dv != nil && pvc.Annotations[AnnPopulatedFor] == dv.Name
+}
+
+// AllowClaimAdoption returns true if the PVC may be adopted
+func AllowClaimAdoption(c client.Client, pvc *corev1.PersistentVolumeClaim, dv *cdiv1.DataVolume) (bool, error) {
+	if pvc == nil || dv == nil {
+		return false, nil
+	}
+	anno, ok := pvc.Annotations[AnnCreatedForDataVolume]
+	if ok && anno == string(dv.UID) {
+		return false, nil
+	}
+	anno, ok = dv.Annotations[AnnAllowClaimAdoption]
+	// if annotation exists, go with that regardless of featuregate
+	if ok {
+		val, _ := strconv.ParseBool(anno)
+		return val, nil
+	}
+	return featuregates.NewFeatureGates(c).ClaimAdoptionEnabled()
 }

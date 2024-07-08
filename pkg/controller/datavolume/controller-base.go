@@ -29,6 +29,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
 
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
@@ -50,6 +51,7 @@ import (
 	"kubevirt.io/containerized-data-importer/pkg/common"
 	cc "kubevirt.io/containerized-data-importer/pkg/controller/common"
 	featuregates "kubevirt.io/containerized-data-importer/pkg/feature-gates"
+	"kubevirt.io/containerized-data-importer/pkg/monitoring"
 	"kubevirt.io/containerized-data-importer/pkg/token"
 	"kubevirt.io/containerized-data-importer/pkg/util"
 )
@@ -76,7 +78,21 @@ const (
 	claimStorageClassNameField = "spec.storageClassName"
 )
 
-var httpClient *http.Client
+var (
+	httpClient *http.Client
+
+	// DataVolumePendingGauge is the metric we use to count the DataVolumes pending for default storage class to be configured
+	DataVolumePendingGauge = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: monitoring.MetricOptsList[monitoring.DataVolumePending].Name,
+			Help: monitoring.MetricOptsList[monitoring.DataVolumePending].Help,
+		},
+	)
+
+	delayedAnnotations = []string{
+		cc.AnnPopulatedFor,
+	}
+)
 
 // Event represents DV controller event
 type Event struct {
@@ -116,7 +132,7 @@ type ReconcilerBase struct {
 	shouldUpdateProgress bool
 }
 
-func pvcIsPopulated(pvc *corev1.PersistentVolumeClaim, dv *cdiv1.DataVolume) bool {
+func pvcIsPopulatedForDataVolume(pvc *corev1.PersistentVolumeClaim, dv *cdiv1.DataVolume) bool {
 	if pvc == nil || dv == nil {
 		return false
 	}
@@ -241,6 +257,7 @@ func addDataVolumeControllerCommonWatches(mgr manager.Manager, dataVolumeControl
 			if getDataVolumeOp(mgr.GetLogger(), dv, mgr.GetClient()) != op {
 				return nil
 			}
+			updatePendingDataVolumesGauge(context.TODO(), mgr.GetLogger(), dv, mgr.GetClient())
 			return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: dv.Namespace, Name: dv.Name}}}
 		}),
 	); err != nil {
@@ -292,6 +309,7 @@ func addDataVolumeControllerCommonWatches(mgr manager.Manager, dataVolumeControl
 	}
 
 	// Watch for SC updates and reconcile the DVs waiting for default SC
+	// Relevant only when the DV StorageSpec has no AccessModes set and no matching StorageClass yet, so PVC cannot be created (test_id:9922)
 	if err := dataVolumeController.Watch(&source.Kind{Type: &storagev1.StorageClass{}}, handler.EnqueueRequestsFromMapFunc(
 		func(obj client.Object) (reqs []reconcile.Request) {
 			dvList := &cdiv1.DataVolumeList{}
@@ -311,6 +329,7 @@ func addDataVolumeControllerCommonWatches(mgr manager.Manager, dataVolumeControl
 	}
 
 	// Watch for PV updates to reconcile the DVs waiting for available PV
+	// Relevant only when the DV StorageSpec has no AccessModes set and no matching StorageClass yet, so PVC cannot be created (test_id:9924,9925)
 	if err := dataVolumeController.Watch(&source.Kind{Type: &corev1.PersistentVolume{}}, handler.EnqueueRequestsFromMapFunc(
 		func(obj client.Object) (reqs []reconcile.Request) {
 			pv := obj.(*corev1.PersistentVolume)
@@ -386,6 +405,41 @@ func getSourceRefOp(log logr.Logger, dv *cdiv1.DataVolume, client client.Client)
 	default:
 		return dataVolumeNop
 	}
+}
+
+func updatePendingDataVolumesGauge(ctx context.Context, log logr.Logger, dv *cdiv1.DataVolume, c client.Client) {
+	if !cc.IsDataVolumeUsingDefaultStorageClass(dv) {
+		return
+	}
+
+	countPending, err := getDefaultStorageClassDataVolumeCount(ctx, c, string(cdiv1.Pending))
+	if err != nil {
+		log.V(3).Error(err, "Failed listing the pending DataVolumes")
+		return
+	}
+	countUnset, err := getDefaultStorageClassDataVolumeCount(ctx, c, string(cdiv1.PhaseUnset))
+	if err != nil {
+		log.V(3).Error(err, "Failed listing the unset DataVolumes")
+		return
+	}
+
+	DataVolumePendingGauge.Set(float64(countPending + countUnset))
+}
+
+func getDefaultStorageClassDataVolumeCount(ctx context.Context, c client.Client, dvPhase string) (int, error) {
+	dvList := &cdiv1.DataVolumeList{}
+	if err := c.List(ctx, dvList, client.MatchingFields{dvPhaseField: dvPhase}); err != nil {
+		return 0, err
+	}
+
+	dvCount := 0
+	for _, dv := range dvList.Items {
+		if cc.IsDataVolumeUsingDefaultStorageClass(&dv) {
+			dvCount++
+		}
+	}
+
+	return dvCount, nil
 }
 
 type dvController interface {
@@ -469,6 +523,10 @@ func (r *ReconcilerBase) syncDvPvcState(log logr.Logger, req reconcile.Request, 
 	updateDataVolumeUseCDIPopulator(&syncState)
 
 	if err := r.handleStaticVolume(&syncState, log); err != nil || syncState.result != nil {
+		return syncState, err
+	}
+
+	if err := r.handleDelayedAnnotations(&syncState, log); err != nil || syncState.result != nil {
 		return syncState, err
 	}
 
@@ -589,6 +647,37 @@ func (r *ReconcilerBase) handleStaticVolume(syncState *dvSyncState, log logr.Log
 	return fmt.Errorf("DataVolume bound to unexpected PV %s", syncState.pvc.Spec.VolumeName)
 }
 
+func (r *ReconcilerBase) handleDelayedAnnotations(syncState *dvSyncState, log logr.Logger) error {
+	dataVolume := syncState.dv
+	if dataVolume.Status.Phase != cdiv1.Succeeded {
+		return nil
+	}
+
+	if syncState.pvc == nil {
+		return nil
+	}
+
+	pvcCpy := syncState.pvc.DeepCopy()
+	for _, anno := range delayedAnnotations {
+		if val, ok := dataVolume.Annotations[anno]; ok {
+			// only add if not already present
+			if _, ok := pvcCpy.Annotations[anno]; !ok {
+				cc.AddAnnotation(pvcCpy, anno, val)
+			}
+		}
+	}
+
+	if !reflect.DeepEqual(syncState.pvc, pvcCpy) {
+		if err := r.updatePVC(pvcCpy); err != nil {
+			return err
+		}
+		syncState.pvc = pvcCpy
+		syncState.result = &reconcile.Result{}
+	}
+
+	return nil
+}
+
 func (r *ReconcilerBase) getAvailableVolumesForDV(syncState *dvSyncState, log logr.Logger) ([]string, error) {
 	pvList := &corev1.PersistentVolumeList{}
 	fields := client.MatchingFields{claimRefField: claimRefIndexKeyFunc(syncState.dv.Namespace, syncState.dv.Name)}
@@ -615,7 +704,7 @@ func (r *ReconcilerBase) getAvailableVolumesForDV(syncState *dvSyncState, log lo
 }
 
 func (r *ReconcilerBase) handlePrePopulation(dv *cdiv1.DataVolume, pvc *corev1.PersistentVolumeClaim) {
-	if pvc.Status.Phase == corev1.ClaimBound && pvcIsPopulated(pvc, dv) {
+	if pvc.Status.Phase == corev1.ClaimBound && pvcIsPopulatedForDataVolume(pvc, dv) {
 		cc.AddAnnotation(dv, cc.AnnPrePopulated, pvc.Name)
 	}
 }
@@ -631,7 +720,11 @@ func (r *ReconcilerBase) validatePVC(dv *cdiv1.DataVolume, pvc *corev1.Persisten
 	// If the PVC is not controlled by this DataVolume resource, we should log
 	// a warning to the event recorder and return
 	if !metav1.IsControlledBy(pvc, dv) {
-		if pvcIsPopulated(pvc, dv) {
+		requiresWork, err := r.pvcRequiresWork(pvc, dv)
+		if err != nil {
+			return err
+		}
+		if !requiresWork {
 			if err := r.addOwnerRef(pvc, dv); err != nil {
 				return err
 			}
@@ -822,15 +915,23 @@ func (r *ReconcilerBase) updateStatus(req reconcile.Request, phaseSync *statusPh
 		dataVolumeCopy.Status.ClaimName = pvc.Name
 
 		phase := pvc.Annotations[cc.AnnPodPhase]
-		if phase == string(cdiv1.Succeeded) {
+		requiresWork, err := r.pvcRequiresWork(pvc, dataVolumeCopy)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+		if phase == string(cdiv1.Succeeded) && requiresWork {
 			if err := dvc.updateStatusPhase(pvc, dataVolumeCopy, &event); err != nil {
 				return reconcile.Result{}, err
 			}
 		} else {
 			switch pvc.Status.Phase {
 			case corev1.ClaimPending:
-				if err := r.updateStatusPVCPending(pvc, dvc, dataVolumeCopy, &event); err != nil {
-					return reconcile.Result{}, err
+				if requiresWork {
+					if err := r.updateStatusPVCPending(pvc, dvc, dataVolumeCopy, &event); err != nil {
+						return reconcile.Result{}, err
+					}
+				} else {
+					dataVolumeCopy.Status.Phase = cdiv1.Succeeded
 				}
 			case corev1.ClaimBound:
 				switch dataVolumeCopy.Status.Phase {
@@ -842,12 +943,12 @@ func (r *ReconcilerBase) updateStatus(req reconcile.Request, phaseSync *statusPh
 					dataVolumeCopy.Status.Phase = cdiv1.PVCBound
 				}
 
-				if pvcIsPopulated(pvc, dataVolumeCopy) {
-					dataVolumeCopy.Status.Phase = cdiv1.Succeeded
-				} else {
+				if requiresWork {
 					if err := dvc.updateStatusPhase(pvc, dataVolumeCopy, &event); err != nil {
 						return reconcile.Result{}, err
 					}
+				} else {
+					dataVolumeCopy.Status.Phase = cdiv1.Succeeded
 				}
 
 			case corev1.ClaimLost:
@@ -1042,6 +1143,8 @@ func (r *ReconcilerBase) newPersistentVolumeClaim(dataVolume *cdiv1.DataVolume, 
 		annotations[cc.AnnPriorityClassName] = dataVolume.Spec.PriorityClassName
 	}
 	annotations[cc.AnnPreallocationRequested] = strconv.FormatBool(cc.GetPreallocation(context.TODO(), r.client, dataVolume.Spec.Preallocation))
+	annotations[cc.AnnCreatedForDataVolume] = string(dataVolume.UID)
+
 	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace:   namespace,
@@ -1071,6 +1174,10 @@ func (r *ReconcilerBase) newPersistentVolumeClaim(dataVolume *cdiv1.DataVolume, 
 			return nil, err
 		}
 		pvc.Annotations[cc.AnnOwnerUID] = string(dataVolume.UID)
+	}
+
+	for _, anno := range delayedAnnotations {
+		delete(pvc.Annotations, anno)
 	}
 
 	return pvc, nil
@@ -1127,6 +1234,14 @@ func (r *ReconcilerBase) shouldBeMarkedWaitForFirstConsumer(pvc *corev1.Persiste
 		pvc.Status.Phase == corev1.ClaimPending
 
 	return res, nil
+}
+
+func (r *ReconcilerBase) shouldReconcileVolumeSourceCR(syncState *dvSyncState) bool {
+	if syncState.pvc == nil {
+		return true
+	}
+	phase := syncState.pvc.Annotations[cc.AnnPodPhase]
+	return phase != string(corev1.PodSucceeded) || syncState.dvMutated.Status.Phase != cdiv1.Succeeded
 }
 
 // shouldBeMarkedPendingPopulation decides whether we should mark DV as PendingPopulation
@@ -1191,4 +1306,21 @@ func (r *ReconcilerBase) shouldUseCDIPopulator(syncState *dvSyncState) (bool, er
 	}
 
 	return usePopulator, nil
+}
+
+func (r *ReconcilerBase) pvcRequiresWork(pvc *corev1.PersistentVolumeClaim, dv *cdiv1.DataVolume) (bool, error) {
+	if pvc == nil || dv == nil {
+		return true, nil
+	}
+	if pvcIsPopulatedForDataVolume(pvc, dv) {
+		return false, nil
+	}
+	canAdopt, err := cc.AllowClaimAdoption(r.client, pvc, dv)
+	if err != nil {
+		return true, err
+	}
+	if canAdopt {
+		return false, nil
+	}
+	return true, nil
 }

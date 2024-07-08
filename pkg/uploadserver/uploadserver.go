@@ -439,7 +439,7 @@ func newAsyncUploadStreamProcessor(stream io.ReadCloser, dest, imageSize string,
 	}
 
 	uds := importer.NewAsyncUploadDataSource(newContentReader(stream, sourceContentType))
-	processor := importer.NewDataProcessor(uds, dest, common.ImporterVolumePath, common.ScratchDataDir, imageSize, filesystemOverhead, preallocation)
+	processor := importer.NewDataProcessor(uds, dest, common.ImporterVolumePath, common.ScratchDataDir, imageSize, filesystemOverhead, preallocation, "")
 	return processor, processor.ProcessDataWithPause()
 }
 
@@ -450,7 +450,7 @@ func newUploadStreamProcessor(stream io.ReadCloser, dest, imageSize string, file
 
 	// Clone block device to block device or file system
 	uds := importer.NewUploadDataSource(newContentReader(stream, sourceContentType), dvContentType)
-	processor := importer.NewDataProcessor(uds, dest, common.ImporterVolumePath, common.ScratchDataDir, imageSize, filesystemOverhead, preallocation)
+	processor := importer.NewDataProcessor(uds, dest, common.ImporterVolumePath, common.ScratchDataDir, imageSize, filesystemOverhead, preallocation, "")
 	err := processor.ProcessData()
 	return processor.PreallocationApplied(), err
 }
@@ -485,7 +485,11 @@ func untarToBlockdev(stream io.Reader, dest string) error {
 		case header == nil:
 			continue
 		}
-		if header.Typeflag == tar.TypeGNUSparse && strings.Contains(header.Name, common.DiskImageName) {
+		if !strings.Contains(header.Name, common.DiskImageName) {
+			continue
+		}
+		switch header.Typeflag {
+		case tar.TypeReg, tar.TypeGNUSparse:
 			klog.Infof("Untaring %d bytes to %s", header.Size, dest)
 			f, err := os.OpenFile(dest, os.O_APPEND|os.O_WRONLY, os.ModeDevice|os.ModePerm)
 			if err != nil {

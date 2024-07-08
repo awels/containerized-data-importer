@@ -29,12 +29,15 @@ import (
 	. "github.com/onsi/gomega"
 	imagev1 "github.com/openshift/api/image/v1"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	ioprometheusclient "github.com/prometheus/client_model/go"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	extv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -50,7 +53,7 @@ import (
 	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 	"kubevirt.io/containerized-data-importer/pkg/common"
 	cc "kubevirt.io/containerized-data-importer/pkg/controller/common"
-	cdv "kubevirt.io/containerized-data-importer/pkg/controller/datavolume"
+	dvc "kubevirt.io/containerized-data-importer/pkg/controller/datavolume"
 )
 
 var (
@@ -263,6 +266,60 @@ var _ = Describe("All DataImportCron Tests", func() {
 			Expect(err).To(HaveOccurred())
 		})
 
+		It("Should delete DataImportCron-orphan CronJob", func() {
+			reconciler = createDataImportCronReconciler()
+
+			cron = newDataImportCron(cronName)
+			err := reconciler.client.Create(context.TODO(), cron)
+			Expect(err).ToNot(HaveOccurred())
+
+			_, err = reconciler.Reconcile(context.TODO(), cronReq)
+			Expect(err).ToNot(HaveOccurred())
+			cronjob := &batchv1.CronJob{}
+			err = reconciler.client.Get(context.TODO(), cronJobKey(cron), cronjob)
+			Expect(err).ToNot(HaveOccurred())
+
+			err = reconciler.client.Delete(context.TODO(), cron)
+			Expect(err).ToNot(HaveOccurred())
+
+			_, err = reconciler.Reconcile(context.TODO(), cronReq)
+			Expect(err).ToNot(HaveOccurred())
+			err = reconciler.client.Get(context.TODO(), cronJobKey(cron), cronjob)
+			Expect(err).To(HaveOccurred())
+			Expect(k8serrors.IsNotFound(err)).To(BeTrue())
+		})
+
+		It("Should update CronJob DataImportCron labels", func() {
+			reconciler = createDataImportCronReconciler()
+
+			cron = newDataImportCron(cronName)
+			err := reconciler.client.Create(context.TODO(), cron)
+			Expect(err).ToNot(HaveOccurred())
+
+			_, err = reconciler.Reconcile(context.TODO(), cronReq)
+			Expect(err).ToNot(HaveOccurred())
+			cronjob := &batchv1.CronJob{}
+			err = reconciler.client.Get(context.TODO(), cronJobKey(cron), cronjob)
+			Expect(err).ToNot(HaveOccurred())
+
+			cronjob.Labels = nil
+			err = reconciler.client.Update(context.TODO(), cronjob)
+			Expect(err).ToNot(HaveOccurred())
+
+			_, err = reconciler.Reconcile(context.TODO(), cronReq)
+			Expect(err).ToNot(HaveOccurred())
+			err = reconciler.client.Get(context.TODO(), cronJobKey(cron), cronjob)
+			Expect(err).ToNot(HaveOccurred())
+
+			cronNsLabel, ok := cronjob.Labels[common.DataImportCronNsLabel]
+			Expect(ok).To(BeTrue())
+			Expect(cronNsLabel).To(Equal(cron.Namespace))
+
+			cronLabel, ok := cronjob.Labels[common.DataImportCronLabel]
+			Expect(ok).To(BeTrue())
+			Expect(cronLabel).To(Equal(cron.Name))
+		})
+
 		It("Should verify CronJob container env variables are empty and no extra volume is set when proxy is not configured", func() {
 			cron = newDataImportCron(cronName)
 			reconciler = createDataImportCronReconciler(cron)
@@ -419,6 +476,9 @@ var _ = Describe("All DataImportCron Tests", func() {
 			err = reconciler.client.Update(context.TODO(), dv)
 			Expect(err).ToNot(HaveOccurred())
 			verifyConditions("Import scheduled", false, false, false, scheduled, inProgress, noSource, &corev1.PersistentVolumeClaim{})
+			// Verify DIC outdated metric is 1 only with pending=true
+			verifyDataImportCronOutdatedMetric(cron, true, 1)
+			verifyDataImportCronOutdatedMetric(cron, false, 0)
 
 			dv.Status.Phase = cdiv1.ImportInProgress
 			err = reconciler.client.Update(context.TODO(), dv)
@@ -434,6 +494,9 @@ var _ = Describe("All DataImportCron Tests", func() {
 			Expect(err).ToNot(HaveOccurred())
 
 			verifyConditions("Import succeeded", false, true, true, noImport, upToDate, ready, &corev1.PersistentVolumeClaim{})
+			// Verify DIC outdated metric is 0 with either pending=true/false
+			verifyDataImportCronOutdatedMetric(cron, true, 0)
+			verifyDataImportCronOutdatedMetric(cron, false, 0)
 
 			sourcePVC := cdiv1.DataVolumeSourcePVC{
 				Namespace: cron.Namespace,
@@ -462,6 +525,80 @@ var _ = Describe("All DataImportCron Tests", func() {
 		},
 			Entry("default schedule", defaultSchedule, "should succeed with a default schedule"),
 			Entry("empty schedule", emptySchedule, "should succeed with an empty schedule"),
+		)
+
+		It("Should recreate DataVolume if the last import was deleted", func() {
+			cron = newDataImportCron(cronName)
+			cron.Annotations[AnnSourceDesiredDigest] = testDigest
+			reconciler = createDataImportCronReconciler(cron)
+
+			_, err := reconciler.Reconcile(context.TODO(), cronReq)
+			Expect(err).ToNot(HaveOccurred())
+			err = reconciler.client.Get(context.TODO(), cronKey, cron)
+			Expect(err).ToNot(HaveOccurred())
+
+			imports := cron.Status.CurrentImports
+			Expect(imports).ToNot(BeEmpty())
+			dvName := imports[0].DataVolumeName
+			Expect(dvName).ToNot(BeEmpty())
+
+			dv := &cdiv1.DataVolume{}
+			err = reconciler.client.Get(context.TODO(), dvKey(dvName), dv)
+			Expect(err).ToNot(HaveOccurred())
+
+			err = reconciler.client.Delete(context.TODO(), dv)
+			Expect(err).ToNot(HaveOccurred())
+			err = reconciler.client.Get(context.TODO(), dvKey(dvName), dv)
+			Expect(err).To(HaveOccurred())
+			Expect(k8serrors.IsNotFound(err)).To(BeTrue())
+
+			_, err = reconciler.Reconcile(context.TODO(), cronReq)
+			Expect(err).ToNot(HaveOccurred())
+
+			err = reconciler.client.Get(context.TODO(), dvKey(dvName), dv)
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		DescribeTable("Should set the DataImportCronOutdated metric correctly", func(isPending bool) {
+			cron = newDataImportCron(cronName)
+			cron.Annotations[AnnSourceDesiredDigest] = testDigest
+
+			reconciler = createDataImportCronReconciler(cron)
+
+			if !isPending {
+				sc := cc.CreateStorageClass(storageClassName, map[string]string{cc.AnnDefaultStorageClass: "true"})
+				err := reconciler.client.Create(context.TODO(), sc)
+				Expect(err).ToNot(HaveOccurred())
+
+				sp := &cdiv1.StorageProfile{}
+				sp.Name = storageClassName
+				err = reconciler.client.Create(context.TODO(), sp)
+				Expect(err).ToNot(HaveOccurred())
+			}
+
+			_, err := reconciler.Reconcile(context.TODO(), cronReq)
+			Expect(err).ToNot(HaveOccurred())
+			err = reconciler.client.Get(context.TODO(), cronKey, cron)
+			Expect(err).ToNot(HaveOccurred())
+
+			imports := cron.Status.CurrentImports
+			Expect(imports).ToNot(BeEmpty())
+			dvName := imports[0].DataVolumeName
+			Expect(dvName).ToNot(BeEmpty())
+
+			dv := &cdiv1.DataVolume{}
+			err = reconciler.client.Get(context.TODO(), dvKey(dvName), dv)
+			Expect(err).ToNot(HaveOccurred())
+
+			_, err = reconciler.Reconcile(context.TODO(), cronReq)
+			Expect(err).ToNot(HaveOccurred())
+
+			// Verify DIC outdated metric is 1 only with correct pending label
+			verifyDataImportCronOutdatedMetric(cron, isPending, 1)
+			verifyDataImportCronOutdatedMetric(cron, !isPending, 0)
+		},
+			Entry("with DataVolume pending for deafult storage class", true),
+			Entry("with deafult storage class", false),
 		)
 
 		It("Should not create DV if PVC exists on DesiredDigest update; Should update DIC and DAS, and GC LRU PVCs", func() {
@@ -654,7 +791,7 @@ var _ = Describe("All DataImportCron Tests", func() {
 			Expect(*dv.Spec.Source.Registry.URL).To(Equal("docker://" + testDockerRef))
 			Expect(dv.Annotations[cc.AnnImmediateBinding]).To(Equal("true"))
 			dv.Status.Phase = cdiv1.Succeeded
-			dv.Status.Conditions = cdv.UpdateReadyCondition(dv.Status.Conditions, corev1.ConditionTrue, "", "")
+			dv.Status.Conditions = dvc.UpdateReadyCondition(dv.Status.Conditions, corev1.ConditionTrue, "", "")
 			err = reconciler.client.Update(context.TODO(), dv)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -807,12 +944,19 @@ var _ = Describe("All DataImportCron Tests", func() {
 
 			BeforeEach(func() {
 				sc := cc.CreateStorageClass(storageClassName, map[string]string{cc.AnnDefaultStorageClass: "true"})
+				mode := corev1.PersistentVolumeMode("dummyfromsp")
 				sp := &cdiv1.StorageProfile{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: storageClassName,
 					},
 					Status: cdiv1.StorageProfileStatus{
 						DataImportCronSourceFormat: &snapFormat,
+						ClaimPropertySets: []cdiv1.ClaimPropertySet{
+							{
+								AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+								VolumeMode:  &mode,
+							},
+						},
 					},
 				}
 				reconciler = createDataImportCronReconciler(sc, sp, createVolumeSnapshotContentCrd(), createVolumeSnapshotClassCrd(), createVolumeSnapshotCrd())
@@ -889,6 +1033,8 @@ var _ = Describe("All DataImportCron Tests", func() {
 				Expect(dv.Annotations[cc.AnnImmediateBinding]).To(Equal("true"))
 
 				pvc := cc.CreatePvc(dv.Name, dv.Namespace, nil, nil)
+				mode := corev1.PersistentVolumeMode("dummy")
+				pvc.Spec.VolumeMode = &mode
 				err = reconciler.client.Create(context.TODO(), pvc)
 				Expect(err).ToNot(HaveOccurred())
 				// DV GCed after hitting succeeded
@@ -902,6 +1048,7 @@ var _ = Describe("All DataImportCron Tests", func() {
 				snap := &snapshotv1.VolumeSnapshot{}
 				err = reconciler.client.Get(context.TODO(), dvKey(dvName), snap)
 				Expect(err).ToNot(HaveOccurred())
+				Expect(snap.Annotations[cc.AnnSourceVolumeMode]).To(Equal("dummy"))
 				snap.Status = &snapshotv1.VolumeSnapshotStatus{
 					ReadyToUse: pointer.Bool(true),
 				}
@@ -1077,6 +1224,68 @@ var _ = Describe("All DataImportCron Tests", func() {
 				Expect(err).To(HaveOccurred())
 				Expect(k8serrors.IsNotFound(err)).To(BeTrue())
 			})
+
+			It("Should set snapshot source volume mode annotation on carried-over-upgrade snapshot", func() {
+				cron = newDataImportCron(cronName)
+				dataSource = nil
+				retentionPolicy := cdiv1.DataImportCronRetainNone
+				cron.Spec.RetentionPolicy = &retentionPolicy
+				err := reconciler.client.Create(context.TODO(), cron)
+				Expect(err).ToNot(HaveOccurred())
+				verifyConditions("Before DesiredDigest is set", false, false, false, noImport, noDigest, "", &snapshotv1.VolumeSnapshot{})
+
+				cc.AddAnnotation(cron, AnnSourceDesiredDigest, testDigest)
+				err = reconciler.client.Update(context.TODO(), cron)
+				Expect(err).ToNot(HaveOccurred())
+				dataSource = &cdiv1.DataSource{}
+				verifyConditions("After DesiredDigest is set", false, false, false, noImport, outdated, noSource, &snapshotv1.VolumeSnapshot{})
+
+				imports := cron.Status.CurrentImports
+				Expect(imports).ToNot(BeNil())
+				Expect(imports).ToNot(BeEmpty())
+				dvName := imports[0].DataVolumeName
+				Expect(dvName).ToNot(BeEmpty())
+				digest := imports[0].Digest
+				Expect(digest).To(Equal(testDigest))
+
+				dv := &cdiv1.DataVolume{}
+				err = reconciler.client.Get(context.TODO(), dvKey(dvName), dv)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(*dv.Spec.Source.Registry.URL).To(Equal(testRegistryURL + "@" + testDigest))
+				Expect(dv.Annotations[cc.AnnImmediateBinding]).To(Equal("true"))
+
+				// DV GCed after hitting succeeded
+				err = reconciler.client.Delete(context.TODO(), dv)
+				Expect(err).ToNot(HaveOccurred())
+				pvc := cc.CreatePvc(dv.Name, dv.Namespace, nil, nil)
+				// Snap already exists, without the source volume mode annotation
+				readyToUse := true
+				snap := &snapshotv1.VolumeSnapshot{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      pvc.Name,
+						Namespace: metav1.NamespaceDefault,
+					},
+					Spec: snapshotv1.VolumeSnapshotSpec{
+						Source: snapshotv1.VolumeSnapshotSource{
+							PersistentVolumeClaimName: &pvc.Name,
+						},
+					},
+					Status: &snapshotv1.VolumeSnapshotStatus{
+						ReadyToUse: &readyToUse,
+					},
+				}
+				err = reconciler.client.Create(context.TODO(), snap)
+				Expect(err).ToNot(HaveOccurred())
+
+				verifyConditions("Import succeeded", false, true, true, noImport, upToDate, ready, &snapshotv1.VolumeSnapshot{})
+
+				snap = &snapshotv1.VolumeSnapshot{}
+				err = reconciler.client.Get(context.TODO(), dvKey(dvName), snap)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(*snap.Status.ReadyToUse).To(BeTrue())
+				Expect(*snap.Spec.Source.PersistentVolumeClaimName).To(Equal(dvName))
+				Expect(snap.Annotations[cc.AnnSourceVolumeMode]).To(Equal("dummyfromsp"))
+			})
 		})
 	})
 })
@@ -1177,7 +1386,13 @@ func newDataImportCron(name string) *cdiv1.DataImportCron {
 							PullMethod: &registryPullNodesource,
 						},
 					},
-					Storage: &cdiv1.StorageSpec{},
+					Storage: &cdiv1.StorageSpec{
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceName(corev1.ResourceStorage): resource.MustParse("1Gi"),
+							},
+						},
+					},
 				},
 			},
 			Schedule:          defaultSchedule,
@@ -1196,6 +1411,21 @@ func verifyConditionState(condType string, condState cdiv1.ConditionState, desir
 	}
 	Expect(condState.Status).To(Equal(desiredStatus))
 	Expect(condState.Reason).To(Equal(desiredReason))
+}
+
+func verifyDataImportCronOutdatedMetric(cron *cdiv1.DataImportCron, isPending bool, expectedValue int) {
+	labels := prometheus.Labels{
+		prometheusCronNsLabel:      cron.Namespace,
+		prometheusCronNameLabel:    cron.Name,
+		prometheusCronPendingLabel: strconv.FormatBool(isPending),
+	}
+	Expect(int(getDataImportCronOutdated(labels))).To(Equal(expectedValue))
+}
+
+func getDataImportCronOutdated(labels prometheus.Labels) float64 {
+	dto := &ioprometheusclient.Metric{}
+	_ = DataImportCronOutdatedGauge.With(labels).Write(dto)
+	return dto.Gauge.GetValue()
 }
 
 func getEnvVar(env []corev1.EnvVar, name string) string {

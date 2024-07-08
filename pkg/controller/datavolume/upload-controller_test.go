@@ -33,14 +33,15 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
 	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 	"kubevirt.io/containerized-data-importer/pkg/common"
 	. "kubevirt.io/containerized-data-importer/pkg/controller/common"
 	"kubevirt.io/containerized-data-importer/pkg/controller/populators"
 	featuregates "kubevirt.io/containerized-data-importer/pkg/feature-gates"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 var (
@@ -110,6 +111,14 @@ var _ = Describe("All DataVolume Tests", func() {
 		Expect(err).ToNot(HaveOccurred())
 		Expect(dv.GetAnnotations()[AnnUsePopulator]).To(Equal("true"))
 
+		pvc := &corev1.PersistentVolumeClaim{}
+		err = reconciler.client.Get(context.TODO(), types.NamespacedName{Name: "test-dv", Namespace: metav1.NamespaceDefault}, pvc)
+		Expect(err).ToNot(HaveOccurred())
+
+		pvc.Annotations[AnnPodPhase] = string(corev1.PodSucceeded)
+		err = reconciler.client.Update(context.TODO(), pvc)
+		Expect(err).ToNot(HaveOccurred())
+
 		dv.Status.Phase = cdiv1.Succeeded
 		err = reconciler.client.Update(context.TODO(), dv)
 		Expect(err).ToNot(HaveOccurred())
@@ -165,6 +174,9 @@ var _ = Describe("All DataVolume Tests", func() {
 		uploadSourceName := volumeUploadSourceName(dv)
 		Expect(pvc.Spec.DataSourceRef.Name).To(Equal(uploadSourceName))
 		Expect(pvc.Spec.DataSourceRef.Kind).To(Equal(cdiv1.VolumeUploadSourceRef))
+		val, ok := pvc.Annotations[AnnCreatedForDataVolume]
+		Expect(ok).To(BeTrue())
+		Expect(val).To(Equal(string(dv.UID)))
 	})
 
 	It("Should always report NA progress for upload population", func() {
@@ -202,6 +214,76 @@ var _ = Describe("All DataVolume Tests", func() {
 		err = reconciler.client.Get(context.TODO(), types.NamespacedName{Name: "test-dv", Namespace: metav1.NamespaceDefault}, dv)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(string(dv.Status.Progress)).To(Equal("N/A"))
+	})
+
+	It("Should adopt a PVC (with annotation)", func() {
+		pvc := CreatePvc("test-dv", metav1.NamespaceDefault, nil, nil)
+		pvc.Status.Phase = corev1.ClaimBound
+		dv := newUploadDataVolume("test-dv")
+		AddAnnotation(dv, AnnAllowClaimAdoption, "true")
+		reconciler = createUploadReconciler(pvc, dv)
+		_, err := reconciler.Reconcile(context.TODO(), reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-dv", Namespace: metav1.NamespaceDefault}})
+		Expect(err).ToNot(HaveOccurred())
+
+		err = reconciler.client.Get(context.TODO(), types.NamespacedName{Name: "test-dv", Namespace: metav1.NamespaceDefault}, pvc)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(pvc.OwnerReferences).To(HaveLen(1))
+		or := pvc.OwnerReferences[0]
+		Expect(or.UID).To(Equal(dv.UID))
+
+		err = reconciler.client.Get(context.TODO(), types.NamespacedName{Name: "test-dv", Namespace: metav1.NamespaceDefault}, dv)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(dv.Status.Phase).To(Equal(cdiv1.Succeeded))
+		Expect(string(dv.Status.Progress)).To(Equal("N/A"))
+		_, ok := pvc.Annotations[AnnCreatedForDataVolume]
+		Expect(ok).To(BeFalse())
+	})
+
+	It("Should adopt a PVC (with featuregate)", func() {
+		pvc := CreatePvc("test-dv", metav1.NamespaceDefault, nil, nil)
+		pvc.Status.Phase = corev1.ClaimBound
+		dv := newUploadDataVolume("test-dv")
+		featureGates := []string{featuregates.DataVolumeClaimAdoption, featuregates.HonorWaitForFirstConsumer}
+		reconciler = createUploadReconcilerWithFeatureGates(featureGates, pvc, dv)
+		_, err := reconciler.Reconcile(context.TODO(), reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-dv", Namespace: metav1.NamespaceDefault}})
+		Expect(err).ToNot(HaveOccurred())
+
+		err = reconciler.client.Get(context.TODO(), types.NamespacedName{Name: "test-dv", Namespace: metav1.NamespaceDefault}, pvc)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(pvc.OwnerReferences).To(HaveLen(1))
+		or := pvc.OwnerReferences[0]
+		Expect(or.UID).To(Equal(dv.UID))
+
+		err = reconciler.client.Get(context.TODO(), types.NamespacedName{Name: "test-dv", Namespace: metav1.NamespaceDefault}, dv)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(dv.Status.Phase).To(Equal(cdiv1.Succeeded))
+		Expect(string(dv.Status.Progress)).To(Equal("N/A"))
+		_, ok := pvc.Annotations[AnnCreatedForDataVolume]
+		Expect(ok).To(BeFalse())
+	})
+
+	It("Should adopt a unbound PVC", func() {
+		pvc := CreatePvc("test-dv", metav1.NamespaceDefault, nil, nil)
+		pvc.Spec.VolumeName = ""
+		pvc.Status.Phase = corev1.ClaimPending
+		dv := newUploadDataVolume("test-dv")
+		AddAnnotation(dv, AnnAllowClaimAdoption, "true")
+		reconciler = createUploadReconciler(pvc, dv)
+		_, err := reconciler.Reconcile(context.TODO(), reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-dv", Namespace: metav1.NamespaceDefault}})
+		Expect(err).ToNot(HaveOccurred())
+
+		err = reconciler.client.Get(context.TODO(), types.NamespacedName{Name: "test-dv", Namespace: metav1.NamespaceDefault}, pvc)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(pvc.OwnerReferences).To(HaveLen(1))
+		or := pvc.OwnerReferences[0]
+		Expect(or.UID).To(Equal(dv.UID))
+
+		err = reconciler.client.Get(context.TODO(), types.NamespacedName{Name: "test-dv", Namespace: metav1.NamespaceDefault}, dv)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(dv.Status.Phase).To(Equal(cdiv1.Succeeded))
+		Expect(string(dv.Status.Progress)).To(Equal("N/A"))
+		_, ok := pvc.Annotations[AnnCreatedForDataVolume]
+		Expect(ok).To(BeFalse())
 	})
 
 	var _ = Describe("Reconcile Datavolume status", func() {
@@ -339,11 +421,15 @@ var _ = Describe("All DataVolume Tests", func() {
 })
 
 func createUploadReconciler(objects ...runtime.Object) *UploadReconciler {
+	return createUploadReconcilerWithFeatureGates([]string{featuregates.HonorWaitForFirstConsumer}, objects...)
+}
+
+func createUploadReconcilerWithFeatureGates(featureGates []string, objects ...runtime.Object) *UploadReconciler {
 	cdiConfig := MakeEmptyCDIConfigSpec(common.ConfigName)
 	cdiConfig.Status = cdiv1.CDIConfigStatus{
 		ScratchSpaceStorageClass: testStorageClass,
 	}
-	cdiConfig.Spec.FeatureGates = []string{featuregates.HonorWaitForFirstConsumer}
+	cdiConfig.Spec.FeatureGates = featureGates
 
 	objs := []runtime.Object{}
 	objs = append(objs, objects...)

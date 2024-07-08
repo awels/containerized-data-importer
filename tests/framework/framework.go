@@ -35,6 +35,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	storagehelpers "k8s.io/component-helpers/storage/volume"
 	"k8s.io/klog/v2"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -52,7 +53,8 @@ const (
 	nsDeleteTime = 5 * time.Minute
 	//NsPrefixLabel provides a cdi prefix label to identify the test namespace
 	NsPrefixLabel = "cdi-e2e"
-	cdiPodPrefix  = "cdi-deployment"
+	//CdiPodPrefix provides the cdi-deployment pod prefix
+	CdiPodPrefix = "cdi-deployment"
 )
 
 // run-time flags
@@ -167,7 +169,7 @@ func (f *Framework) BeforeEach() {
 	}
 
 	if f.ControllerPod == nil {
-		pod, err := utils.FindPodByPrefix(f.K8sClient, f.CdiInstallNs, cdiPodPrefix, common.CDILabelSelector)
+		pod, err := utils.FindPodByPrefix(f.K8sClient, f.CdiInstallNs, CdiPodPrefix, common.CDILabelSelector)
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 		fmt.Fprintf(ginkgo.GinkgoWriter, "INFO: Located cdi-controller-pod: %q\n", pod.Name)
 		f.ControllerPod = pod
@@ -364,7 +366,6 @@ func (f *Framework) GetTokenForServiceAccount(namespace, name string) (string, e
 	if err != nil {
 		return "", err
 	}
-	fmt.Fprintf(ginkgo.GinkgoWriter, "INFO: Token created for SA: %+v\n", token.Status)
 
 	return token.Status.Token, nil
 }
@@ -741,7 +742,7 @@ func (f *Framework) GetNoSnapshotStorageClass() *string {
 		return nil
 	}
 	for _, sc := range scs.Items {
-		if sc.Name == "local" || strings.Contains(sc.Provisioner, "no-provisioner") {
+		if sc.Name == "local" || sc.Provisioner == storagehelpers.NotSupportedProvisioner {
 			continue
 		}
 		for _, vsc := range vscs.Items {
